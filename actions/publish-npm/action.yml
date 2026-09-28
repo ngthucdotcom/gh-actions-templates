@@ -1,0 +1,126 @@
+name: 'Publish npm package'
+description: >
+  Computes/validates the target version, loads build/test config from
+  .github-ci.yml, optionally gates on tests, overwrites the package version,
+  builds, and publishes dist/ to npm via OIDC Trusted Publishing. Must run
+  after a checkout step (local composite actions are resolved from the
+  checked-out workspace). The calling job otherwise only needs to declare
+  the trigger, permissions (id-token: write), and environment.
+  Requires a matching Trusted Publisher entry configured on npmjs.com for
+  this exact repo + workflow filename (+ environment, if one is set there).
+
+inputs:
+  version-mode:
+    description: "'short-sha' (version-prefix + git short sha) or 'tag' (strip leading v from the pushed tag)"
+    required: true
+  version-prefix:
+    description: "Required when version-mode is 'short-sha', e.g. '1.0.0-dev'"
+    required: false
+    default: ''
+  tag-pattern:
+    description: "Required tag format when version-mode is 'tag' (bash regex, no leading v stripped yet)"
+    required: false
+    default: '^v[0-9]+\.[0-9]+\.[0-9]+$'
+  require-ancestor-branch:
+    description: "When version-mode is 'tag', the tagged commit must be reachable from this branch. Empty = skip check"
+    required: false
+    default: ''
+  npm-dist-tag:
+    description: 'npm dist-tag to publish under (e.g. dev, rc). Empty = default (latest)'
+    required: false
+    default: ''
+  build-kind:
+    description: "Which build commands to use from .github-ci.yml: 'dev' or 'prod'"
+    required: true
+  run-tests:
+    description: 'Whether to run TEST_RUN_COMMANDS (if configured) before building'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Compute and validate version
+      id: version
+      shell: bash
+      run: |
+        if [ "${{ inputs.version-mode }}" = "tag" ]; then
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ${{ inputs.tag-pattern }} ]]; then
+            echo "::error::Tag '$TAG' does not match required pattern ${{ inputs.tag-pattern }}"
+            exit 1
+          fi
+          if [ -n "${{ inputs.require-ancestor-branch }}" ]; then
+            git fetch origin "${{ inputs.require-ancestor-branch }}" --quiet
+            if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${{ inputs.require-ancestor-branch }}"; then
+              echo "::error::Tag $TAG (commit ${GITHUB_SHA}) is not reachable from ${{ inputs.require-ancestor-branch }}. Refusing to publish."
+              exit 1
+            fi
+          fi
+          VERSION="${TAG#v}"
+        else
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          VERSION="${{ inputs.version-prefix }}-${SHORT_SHA}"
+        fi
+        echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Install yq
+      shell: bash
+      run: |
+        if ! command -v yq >/dev/null 2>&1; then
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+        fi
+
+    - name: Load CI config
+      id: cfg
+      shell: bash
+      run: |
+        CONFIG_FILE=".github-ci.yml"
+        if [ ! -f "$CONFIG_FILE" ]; then
+          echo "::error::$CONFIG_FILE not found at repo root"
+          exit 1
+        fi
+        if [ "${{ inputs.build-kind }}" = "prod" ]; then
+          BUILD_KEY=".PROD_BUILD_COMMANDS"
+        else
+          BUILD_KEY=".DEV_BUILD_COMMANDS"
+        fi
+        {
+          echo "node_version=$(yq '.NODE_VERSION // "20"' "$CONFIG_FILE")"
+          echo "build_commands=$(yq "${BUILD_KEY} // \"npm ci && npm run build\"" "$CONFIG_FILE")"
+          echo "test_commands=$(yq '.TEST_RUN_COMMANDS // ""' "$CONFIG_FILE")"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.cfg.outputs.node_version }}
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Ensure npm supports Trusted Publishing (OIDC)
+      shell: bash
+      run: npm install -g npm@latest
+
+    - name: Run tests
+      if: inputs.run-tests == 'true' && steps.cfg.outputs.test_commands != ''
+      shell: bash
+      run: ${{ steps.cfg.outputs.test_commands }}
+
+    - name: Set package version
+      shell: bash
+      run: npm pkg set version="${{ steps.version.outputs.value }}"
+
+    - name: Build
+      shell: bash
+      run: ${{ steps.cfg.outputs.build_commands }}
+
+    - name: Publish to npm (OIDC Trusted Publishing)
+      shell: bash
+      working-directory: dist
+      run: |
+        if [ -n "${{ inputs.npm-dist-tag }}" ]; then
+          npm publish --access public --tag "${{ inputs.npm-dist-tag }}"
+        else
+          npm publish --access public
+        fi
